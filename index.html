@@ -149,6 +149,7 @@ label.check { display: flex; gap: 8px; align-items: center; cursor: pointer; fon
 .asset .meta { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .asset .val { font: 600 17px/1 var(--font-display); font-variant-numeric: tabular-nums; }
 .starts { font-size: 11px; font-weight: 700; color: var(--good); }
+.benchtag { font-size: 11px; font-weight: 700; color: var(--muted); }
 .verdict { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
 .stat { background: var(--surface-2); border-radius: 10px; padding: 8px 10px; }
 .stat .k { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
@@ -382,6 +383,12 @@ function bestLineup(players) {
   return lu;
 }
 const lineupTotal = lu => SLOTS.reduce((t, s) => t + (lu[s] ? lu[s].season : 0), 0);
+// Which of these players (by id) made the lineup, and at what slot: { id: "WR2", ... }
+function slotsOf(lu, ids) {
+  const out = {};
+  for (const s of SLOTS) if (lu[s] && ids.has(lu[s].id)) out[lu[s].id] = s;
+  return out;
+}
 const lineupValue = players => lineupTotal(bestLineup(players));
 
 function classify(rank, wins) {
@@ -475,15 +482,14 @@ async function findTrades(me, teams, locked, onProgress) {
         let fx = memo.get(c.playerKey);
         if (fx === undefined) {
           const sentIds = new Set(c.items.map(p => p.id));
-          const myAfter = mine.filter(p => !sentIds.has(p.id)).concat(get.players);
-          const gain = lineupValue(myAfter) - current;
+          const myLu = bestLineup(mine.filter(p => !sentIds.has(p.id)).concat(get.players));
+          const gain = lineupTotal(myLu) - current;
           if (gain < RULES.minGain) fx = null;
           else {
             const sentPlayers = c.items.filter(p => p.pos !== "PICK");
             const theirLu = bestLineup(team.players.filter(p => !getIds.has(p.id)).concat(sentPlayers));
-            const startsFor = {};
-            for (const s of SLOTS) if (theirLu[s] && sentIds.has(theirLu[s].id)) startsFor[theirLu[s].id] = s;
-            fx = { gain, theirChange: lineupTotal(theirLu) - theirCurrent, startsFor };
+            fx = { gain, theirChange: lineupTotal(theirLu) - theirCurrent,
+                   startsFor: slotsOf(theirLu, sentIds), startsForMe: slotsOf(myLu, getIds) };
           }
           memo.set(c.playerKey, fx);
         }
@@ -492,7 +498,7 @@ async function findTrades(me, teams, locked, onProgress) {
         if (!cards.has(cardKey)) cards.set(cardKey, { key: cardKey, team, get: get.players,
           starterForThem: get.players.some(p => theirStarters.has(p.id)), pkgs: [] });
         cards.get(cardKey).pkgs.push({ give: c.items, getPicks: get.picks, sent: c.sent, getValue, ratio,
-          gain: fx.gain, theirChange: fx.theirChange, startsFor: fx.startsFor, sendsPick: c.hasPick });
+          gain: fx.gain, theirChange: fx.theirChange, startsFor: fx.startsFor, startsForMe: fx.startsForMe, sendsPick: c.hasPick });
       }
     }
   }
@@ -550,6 +556,11 @@ function assetRow(p, extra = "") {
   return `<div class="asset">${avatar(p)}<div class="who"><div class="nm">${esc(p.name)}</div><div class="meta">${metaLine(p)}${extra}</div></div>
     <div class="val">${fmt(p.dynasty)}</div></div>`;
 }
+function myTag(p, slots) {
+  if (p.pos === "PICK") return "";
+  return slots[p.id] ? `<span class="starts">starts at ${slots[p.id]} for you</span>` : `<span class="benchtag">bench for you</span>`;
+}
+const theirTag = (p, slots) => slots[p.id] ? `<span class="starts">starts at ${slots[p.id]} for them</span>` : "";
 function gauge(ratio) {
   // Scale 70%-150%. Green zone = fair price band.
   const lo = 0.7, hi = 1.5, pct = v => Math.max(0, Math.min(100, (v - lo) / (hi - lo) * 100));
@@ -649,7 +660,7 @@ function cardHTML({ card, pkgs }) {
   const t = card.team;
   const getAssets = [...card.get, ...p.getPicks];
   const open = S.open.has(card.key);
-  const giveRows = p.give.map(g => assetRow(g, p.startsFor[g.id] ? `<span class="starts">starts at ${p.startsFor[g.id]} for them</span>` : "")).join("");
+  const giveRows = p.give.map(g => assetRow(g, theirTag(g, p.startsFor))).join("");
   const alts = pkgs.map((q, i) => `<button type="button" class="alt ${i === sel ? "on" : ""}" data-act="feature" data-card="${esc(card.key)}" data-i="${i}">
       <span class="g">${q.give.map(g => esc(g.name)).join(" + ")}${q.getPicks.length ? ` <span class="muted">(get back ${esc(q.getPicks[0].name)})</span>` : ""}</span>
       <span class="num good">${signed(q.gain)}</span><span class="num muted">${Math.round(q.ratio * 100)}%</span></button>`).join("");
@@ -658,7 +669,7 @@ function cardHTML({ card, pkgs }) {
       <span>· needs ${t.needs.slice(0, 3).join(", ") || "nothing"}</span>
       <span>· ${card.starterForThem ? "takes a starter" : "from their bench"}</span></div>
     <div class="offer">
-      <div class="side"><h3><span>You get</span><span class="num">${fmt(p.getValue)}</span></h3>${getAssets.map(a => assetRow(a)).join("")}</div>
+      <div class="side"><h3><span>You get</span><span class="num">${fmt(p.getValue)}</span></h3>${getAssets.map(a => assetRow(a, myTag(a, p.startsForMe))).join("")}</div>
       <div class="side"><h3><span>You give</span><span class="num">${fmt(p.sent)}</span></h3>${giveRows}</div>
     </div>
     ${verdict(p.gain, p.theirChange, p.ratio)}
@@ -731,13 +742,11 @@ function evalTrade(partner, giveIds, getIds) {
   const me = S.me;
   const give = me.players.filter(p => giveIds.has(p.id)), get = partner.players.filter(p => getIds.has(p.id));
   const sent = give.reduce((n, p) => n + p.dynasty, 0), got = get.reduce((n, p) => n + p.dynasty, 0);
-  const myAfter = me.players.filter(p => !giveIds.has(p.id)).concat(get);
-  const theirAfter = partner.players.filter(p => !getIds.has(p.id)).concat(give);
-  const theirLu = bestLineup(theirAfter);
-  const startsFor = {};
-  for (const s of SLOTS) if (theirLu[s] && giveIds.has(theirLu[s].id)) startsFor[theirLu[s].id] = s;
+  const myLu = bestLineup(me.players.filter(p => !giveIds.has(p.id)).concat(get));
+  const theirLu = bestLineup(partner.players.filter(p => !getIds.has(p.id)).concat(give));
   return { give, get, sent, got, ratio: got ? sent / got : Infinity,
-           gain: lineupValue(myAfter) - me.lineupValue, theirChange: lineupTotal(theirLu) - partner.lineupValue, startsFor };
+           gain: lineupTotal(myLu) - me.lineupValue, theirChange: lineupTotal(theirLu) - partner.lineupValue,
+           startsFor: slotsOf(theirLu, giveIds), startsForMe: slotsOf(myLu, getIds) };
 }
 function renderCalc() {
   const el = $("view-calc");
@@ -750,7 +759,7 @@ function renderCalc() {
   const list = (team, set, side) => team.players.filter(p => p.dynasty > 0 || p.season > 0).map(p => `
     <button type="button" class="pickable ${set.has(p.id) ? "on" : ""}" data-act="calc-toggle" data-side="${side}" data-v="${esc(p.id)}">
       <span class="box">${set.has(p.id) ? "✓" : ""}</span>${avatar(p, "sm")}
-      <span class="who"><span class="nm" style="display:block">${esc(p.name)}</span><span class="meta" style="display:flex;gap:6px;flex-wrap:wrap">${metaLine(p)}${side === "give" && r.startsFor[p.id] ? `<span class="starts">starts at ${r.startsFor[p.id]} for them</span>` : ""}</span></span>
+      <span class="who"><span class="nm" style="display:block">${esc(p.name)}</span><span class="meta" style="display:flex;gap:6px;flex-wrap:wrap">${metaLine(p)}${!set.has(p.id) ? "" : side === "give" ? theirTag(p, r.startsFor) : myTag(p, r.startsForMe)}</span></span>
       <span class="val">${fmt(p.dynasty)}</span></button>`).join("");
   const empty = !c.give.size && !c.get.size;
   el.innerHTML = `
@@ -763,8 +772,8 @@ function renderCalc() {
     <div class="panel calc-result">
       ${empty ? `<div class="muted">Select players or picks below.</div>` : `
       <div class="offer">
-        <div class="side"><h3><span>You get</span><span class="num">${fmt(r.got)}</span></h3>${r.get.map(a => assetRow(a)).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
-        <div class="side"><h3><span>You give</span><span class="num">${fmt(r.sent)}</span></h3>${r.give.map(a => assetRow(a, r.startsFor[a.id] ? `<span class="starts">starts at ${r.startsFor[a.id]} for them</span>` : "")).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
+        <div class="side"><h3><span>You get</span><span class="num">${fmt(r.got)}</span></h3>${r.get.map(a => assetRow(a, myTag(a, r.startsForMe))).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
+        <div class="side"><h3><span>You give</span><span class="num">${fmt(r.sent)}</span></h3>${r.give.map(a => assetRow(a, theirTag(a, r.startsFor))).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
       </div>${verdict(r.gain, r.theirChange, r.ratio)}`}
     </div>
     <div class="calc-grid">
