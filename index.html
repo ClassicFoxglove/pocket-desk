@@ -526,7 +526,8 @@ const S = {
   tab: store.get("tab", "trades"),
   locked: null,                       // Set of my asset ids I won't trade
   f: { types: new Set(["Contender", "Middle", "Rebuilder"]), get: new Set(["one", "two", "picks"]),
-       send: 3, sendPicks: "any", need: null, noHurt: false, starts: false, q: "", sort: "gain" },
+       send: 3, sendPicks: "any", need: null, noHurt: false, starts: false, q: "", sort: "gain",
+       team: null },                  // roster id of one partner team, or null for all teams
   filtersOpen: false,
   featured: new Map(), open: new Set(), leagueOpen: null,
   calc: { partner: null, give: new Set(), get: new Set() },
@@ -597,7 +598,8 @@ function visibleCards() {
   const score = p => f.sort === "gain" ? p.gain : f.sort === "theirs" ? p.theirChange : -p.ratio;
   const res = [];
   for (const card of S.cards) {
-    if (!f.types.has(card.team.type)) continue;
+    if (f.team !== null) { if (card.team.rid !== f.team) continue; }   // one team picked: ignore the type chips
+    else if (!f.types.has(card.team.type)) continue;
     if (card.get.length === 1 && !f.get.has("one") && !f.get.has("picks")) continue;
     if (card.get.length === 2 && !f.get.has("two")) continue;
     if (f.need && !card.get.some(p => SLOT_POS[f.need].includes(p.pos))) continue;
@@ -640,7 +642,12 @@ function renderTrades() {
           <option value="cost" ${f.sort === "cost" ? "selected" : ""}>Cheapest price</option>
         </select>
       </div>
-      <div class="frow"><span class="lbl">Trade with</span>${chipsHTML("types", [["Contender", "Contenders"], ["Middle", "Middle"], ["Rebuilder", "Rebuilders"]], v => f.types.has(v))}</div>
+      <div class="frow"><span class="lbl">Team</span><div class="search">
+        <select class="input" id="teamFilter" aria-label="Only show trades with this team">
+          <option value="" ${f.team === null ? "selected" : ""}>All teams</option>
+          ${S.teams.filter(t => t !== me).map(t => `<option value="${t.rid}" ${f.team === t.rid ? "selected" : ""}>${esc(t.name)} (${t.type}, ${t.record})</option>`).join("")}
+        </select></div></div>
+      ${f.team === null ? `<div class="frow"><span class="lbl">Trade with</span>${chipsHTML("types", [["Contender", "Contenders"], ["Middle", "Middle"], ["Rebuilder", "Rebuilders"]], v => f.types.has(v))}</div>` : ""}
       <div class="frow"><span class="lbl">I get</span>${chipsHTML("get", [["one", "1 player"], ["two", "2 players"], ["picks", "Player + pick back"]], v => f.get.has(v))}</div>
       <div class="frow"><span class="lbl">I send</span>${chipsHTML("send", [[1, "1 asset"], [2, "Up to 2"], [3, "Up to 3"]], v => f.send === +v)}</div>
       <div class="frow"><span class="lbl">My picks</span>${chipsHTML("sendPicks", [["any", "Any"], ["no", "Keep my picks"], ["yes", "Include picks"]], v => f.sendPicks === v)}</div>
@@ -648,7 +655,8 @@ function renderTrades() {
         <label class="check"><input type="checkbox" id="noHurt" ${f.noHurt ? "checked" : ""}> Their lineup doesn't get worse</label>
         <label class="check"><input type="checkbox" id="starts" ${f.starts ? "checked" : ""}> One of my players would start for them</label></div></div>
     </div>
-    <div class="count"><span>${S.busy ? "Crunching trades…" : `${vis.length} trade targets · ${total} offers`}</span>
+    <div class="count"><span>${S.busy ? "Crunching trades…" : `${vis.length} trade targets · ${total} offers`}${f.team !== null && !S.busy
+        ? ` with <b>${esc((S.teams.find(t => t.rid === f.team) || {}).name)}</b> · <button type="button" class="linkbtn" data-act="team-all">show all teams</button>` : ""}</span>
       <span>${[...S.locked].length ? `Untouchable: ${esc(me.players.filter(p => S.locked.has(p.id)).map(p => p.name).join(", "))} · <button type="button" class="linkbtn" data-act="tab" data-v="team">change</button>` : ""}</span></div>
     <div class="cards">${vis.slice(0, 60).map(cardHTML).join("") || (S.busy ? "" : `<div class="panel loading">No trades match these filters. Try turning a filter back on.</div>`)}</div>
     ${vis.length > 60 ? `<p class="muted">Showing the top 60. Use search or filters to narrow down.</p>` : ""}`;
@@ -726,7 +734,9 @@ function renderLeague() {
       <td class="muted">${t.needs.slice(0, 3).join(", ") || "—"}</td></tr>
       ${open ? `<tr class="team-detail"><td colspan="8"><div style="font-size:12px;font-weight:700;color:var(--muted);margin-bottom:6px">BEST LINEUP</div>
         <div class="mini">${lu.map(p => `<div class="asset">${avatar(p, "sm")}<div class="who"><div class="nm" style="font-size:13px">${esc(p.name)}</div><div class="meta">${metaLine(p)} ${fmt(p.season)}</div></div></div>`).join("")}</div>
-        ${t !== S.me ? `<button type="button" class="btn btn-ghost" style="margin-top:10px" data-act="calc-with" data-v="${t.rid}">Build a trade with ${esc(t.name)}</button>` : ""}</td></tr>` : ""}`;
+        ${t !== S.me ? `<div class="chips" style="margin-top:10px">
+          <button type="button" class="btn btn-accent" data-act="ideas-with" data-v="${t.rid}">See trade ideas with ${esc(t.name)}</button>
+          <button type="button" class="btn btn-ghost" data-act="calc-with" data-v="${t.rid}">Build my own trade</button></div>` : ""}</td></tr>` : ""}`;
   }).join("");
   el.innerHTML = `
     <h2>League at a glance</h2>
@@ -823,6 +833,8 @@ document.addEventListener("click", e => {
     render();
     return recompute();
   } else if (act === "league-row") S.leagueOpen = S.leagueOpen === +v ? null : +v;
+  else if (act === "team-all") f.team = null;
+  else if (act === "ideas-with") { f.team = +v; return setTab("trades"); }
   else if (act === "calc-with") { S.calc = { partner: +v, give: new Set(), get: new Set() }; return setTab("calc"); }
   else if (act === "calc-toggle") { const set = b.dataset.side === "give" ? S.calc.give : S.calc.get; set.has(v) ? set.delete(v) : set.add(v); }
   else if (act === "calc-clear") { S.calc.give.clear(); S.calc.get.clear(); }
@@ -832,6 +844,7 @@ document.addEventListener("input", e => {
   const id = e.target.id, f = S.f;
   if (id === "q") { f.q = e.target.value; renderKeepingFocus("q"); }
   else if (id === "sort") { f.sort = e.target.value; render(); }
+  else if (id === "teamFilter") { f.team = e.target.value === "" ? null : +e.target.value; render(); }
   else if (id === "noHurt" || id === "starts") { f[id] = e.target.checked; render(); }
   else if (id === "partner") { S.calc = { partner: +e.target.value, give: S.calc.give, get: new Set() }; render(); }
 });
