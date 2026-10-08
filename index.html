@@ -150,6 +150,18 @@ label.check { display: flex; gap: 8px; align-items: center; cursor: pointer; fon
 .asset .val { font: 600 17px/1 var(--font-display); font-variant-numeric: tabular-nums; }
 .starts { font-size: 11px; font-weight: 700; color: var(--good); }
 .benchtag { font-size: 11px; font-weight: 700; color: var(--muted); }
+.trend { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.trend.up { color: var(--good); } .trend.down { color: var(--bad); }
+.tag.active { background: var(--accent-soft); color: var(--accent); }
+.star { display: inline-flex; gap: 5px; align-items: center; }
+.star svg { fill: none; }
+.star.on svg { fill: currentColor; }
+.alert { padding: 12px 14px; border-left: 4px solid var(--warn); }
+.alert.ok { border-left-color: var(--good); color: var(--muted); }
+.alert-h { font: 700 15px/1 var(--font-display); letter-spacing: .08em; text-transform: uppercase; color: var(--ink); margin-bottom: 8px; }
+.alert ul { margin: 0 0 8px; padding-left: 18px; display: grid; gap: 4px; }
+.tab { position: relative; }
+.tab.alerting::after { content: ""; position: absolute; top: 8px; right: 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
 .verdict { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
 .stat { background: var(--surface-2); border-radius: 10px; padding: 8px 10px; }
 .stat .k { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
@@ -279,7 +291,7 @@ const RULES = {
   fairMin: 1.00, fairMax: 1.20,   // you pay 100-120% of what you get
   consolidation: 1.10,            // 110%+ when you send more pieces than you get
   minGain: 300,                   // ignore trades that barely move your lineup
-  maxSend: 3,                     // up to 3 assets out
+  maxSend: 4,                     // up to 4 assets out (a 4th only when 2+ of them are picks)
   keepPerKind: 3,                 // options kept per card for each kind
 };
 const DEFAULT_LOCKED = ["Bijan Robinson", "Brock Bowers"];
@@ -305,12 +317,12 @@ async function loadPlayers(neededIds, force) {
   // Sleeper's full player file is ~5 MB, so keep a trimmed copy (rostered players only) for a day.
   const cached = store.get("players_v1", null);
   const fresh = cached && Date.now() - cached.t < 24 * 3600 * 1000;
-  if (!force && fresh && neededIds.every(id => cached.p[id])) return cached.p;
+  if (!force && fresh && neededIds.every(id => id in cached.p)) return cached.p;
   const all = await getJSON(`${SLEEPER}/players/nfl`);
   const p = {};
   for (const id of neededIds) {
     const x = all[id];
-    if (!x) continue;
+    if (!x) { p[id] = null; continue; }   // remember it's missing so we don't re-download for it
     p[id] = { n: x.full_name || `${x.first_name || ""} ${x.last_name || ""}`.trim() || id,
               pos: x.position || "?", team: x.team || null, age: x.age || null, inj: x.injury_status || null };
   }
@@ -319,20 +331,63 @@ async function loadPlayers(neededIds, force) {
 }
 
 async function loadAll(force) {
-  const [league, users, rosters, traded, fc] = await Promise.all([
+  const [league, users, rosters, traded, fc, state] = await Promise.all([
     getJSON(`${SLEEPER}/league/${LEAGUE_ID}`), getJSON(`${SLEEPER}/league/${LEAGUE_ID}/users`),
     getJSON(`${SLEEPER}/league/${LEAGUE_ID}/rosters`), getJSON(`${SLEEPER}/league/${LEAGUE_ID}/traded_picks`),
-    getJSON(FC_URL),
+    getJSON(FC_URL), getJSON(`${SLEEPER}/state/nfl`),
   ]);
-  const ids = rosters.flatMap(r => r.players || []);
-  const players = await loadPlayers(ids, force);
-  return { league, users, rosters, traded, fc, players, at: Date.now() };
+  // Rostered players plus everyone FantasyCalc values (so free agents get names and injury tags).
+  const ids = [...new Set([...rosters.flatMap(r => r.players || []),
+                           ...fc.map(r => r.player.sleeperId).filter(id => id && !id.startsWith("FP_"))])];
+  const [players, trades, byes] = await Promise.all([loadPlayers(ids, force), loadTrades(league, rosters, state), loadByes(state)]);
+  return { league, users, rosters, traded, fc, players, trades, byes, week: state.week, at: Date.now() };
+}
+
+// NFL teams with no game this week (from Sleeper's schedule). Optional: null if it fails.
+async function loadByes(state) {
+  try {
+    // The schedule lives outside Sleeper's documented /v1 API.
+    const games = await getJSON(`https://api.sleeper.app/schedule/nfl/regular/${state.season}`);
+    const all = new Set(), playing = new Set();
+    for (const g of games) {
+      all.add(g.home); all.add(g.away);
+      if (g.week === state.week) { playing.add(g.home); playing.add(g.away); }
+    }
+    return state.season_type === "regular" ? [...all].filter(t => !playing.has(t)) : [];
+  } catch {
+    return null;
+  }
+}
+
+// Completed trades this season and last season, as lists of current roster ids.
+// Optional extra: if it fails, the app works without the "active traders" badges.
+async function loadTrades(league, rosters, state) {
+  try {
+    const thisWeeks = state.season === league.season ? Math.max(1, state.week) : 18;
+    const ridByOwner = Object.fromEntries(rosters.map(r => [r.owner_id, r.roster_id]));
+    const seasons = [{ id: LEAGUE_ID, weeks: thisWeeks, map: rid => rid }];
+    if (league.previous_league_id) {
+      // Roster ids can differ between seasons, so match last season's rosters to owners.
+      const prev = await getJSON(`${SLEEPER}/league/${league.previous_league_id}/rosters`);
+      const prevOwner = Object.fromEntries(prev.map(r => [r.roster_id, r.owner_id]));
+      seasons.push({ id: league.previous_league_id, weeks: 18, map: rid => ridByOwner[prevOwner[rid]] ?? null });
+    }
+    const out = [];
+    await Promise.all(seasons.flatMap(s => Array.from({ length: s.weeks }, (_, i) =>
+      getJSON(`${SLEEPER}/league/${s.id}/transactions/${i + 1}`).then(list => {
+        for (const x of list) if (x.type === "trade" && x.status === "complete")
+          out.push({ rids: x.roster_ids.map(s.map).filter(r => r != null), at: x.status_updated || x.created });
+      }))));
+    return out;
+  } catch {
+    return null;
+  }
 }
 
 // ======================= league model =======================
 function buildTeams(raw) {
   const values = {};
-  for (const row of raw.fc) if (row.player.sleeperId) values[row.player.sleeperId] = { d: row.value, s: row.redraftValue };
+  for (const row of raw.fc) if (row.player.sleeperId) values[row.player.sleeperId] = { d: row.value, s: row.redraftValue, t: row.trend30Day || 0 };
   const names = {};
   for (const u of raw.users) names[u.user_id] = (u.metadata && u.metadata.team_name) || u.display_name;
 
@@ -342,9 +397,9 @@ function buildTeams(raw) {
                 record: `${r.settings.wins}-${r.settings.losses}`, dynasty: 0, season: 0, picksValue: 0, players: [] };
     for (const id of r.players || []) {
       const info = raw.players[id] || { n: id, pos: "?" };
-      const v = values[id] || { d: 0, s: 0 };
+      const v = values[id] || { d: 0, s: 0, t: 0 };
       t.players.push({ id, name: info.n, pos: info.pos, team: info.team, age: info.age, injury: info.inj,
-                       dynasty: v.d, season: v.s, starter: starters.has(id) });
+                       dynasty: v.d, season: v.s, trend: v.t, starter: starters.has(id) });
       t.dynasty += v.d; t.season += v.s;
     }
     return t;
@@ -360,16 +415,72 @@ function buildTeams(raw) {
   for (const [k, cur] of Object.entries(owner)) {
     const [season, rs, origS] = k.split("|"); const rnd = +rs, orig = +origS;
     const key = season === "2027" ? `FP_2027_${tier[orig]}_${rnd - 1}` : `FP_${season}_${rnd}`;
-    const value = (values[key] || { d: 0 }).d;
+    const value = (values[key] || { d: 0 }).d, trend = (values[key] || { t: 0 }).t;
     let name = `${season} ${ROUND_NAMES[rnd]}`;
     if (season === "2027") name += ` (${tier[orig][0].toUpperCase() + tier[orig].slice(1)})`;
     const t = byId[cur];
     t.players.push({ id: `pick-${season}-${rnd}-${orig}`, name, pos: "PICK", pickYear: season, round: rnd,
-                     via: orig !== cur ? byId[orig].name : null, dynasty: value, season: 0, team: null, age: null, injury: null });
+                     via: orig !== cur ? byId[orig].name : null, dynasty: value, season: 0, trend, team: null, age: null, injury: null });
     t.dynasty += value; t.picksValue += value;
   }
   for (const t of teams) t.players.sort((a, b) => (a.pos === "PICK") - (b.pos === "PICK") || b.dynasty - a.dynasty);
   return teams;
+}
+
+// Players FantasyCalc values for this season who are on nobody's roster.
+function buildFreeAgents(raw) {
+  const rostered = new Set(raw.rosters.flatMap(r => r.players || []));
+  const out = [];
+  for (const row of raw.fc) {
+    const id = row.player.sleeperId;
+    if (!id || id.startsWith("FP_") || rostered.has(id) || !(row.redraftValue > 0)) continue;
+    const info = raw.players[id] || {};
+    const pos = info.pos || row.player.position;
+    if (!["QB", "RB", "WR", "TE"].includes(pos)) continue;
+    out.push({ id, name: info.n || row.player.name, pos, team: info.team ?? row.player.maybeTeam ?? null,
+               age: info.age || (row.player.maybeAge ? Math.floor(row.player.maybeAge) : null), injury: info.inj || null,
+               dynasty: row.value, season: row.redraftValue, trend: row.trend30Day || 0, starter: false });
+  }
+  return out;
+}
+
+// For each team: how many completed trades (this + last season) and how many with me.
+function tradeActivity(trades) {
+  if (!trades) return null;
+  const count = {}, withMe = {};
+  for (const t of trades) for (const rid of t.rids) {
+    count[rid] = (count[rid] || 0) + 1;
+    if (t.rids.includes(MY_ROSTER_ID) && rid !== MY_ROSTER_ID) withMe[rid] = (withMe[rid] || 0) + 1;
+  }
+  // "Trades often" = at or above the league's upper third, and at least 3 trades.
+  const sorted = Object.values(count).sort((a, b) => a - b);
+  const often = Math.max(3, sorted[Math.floor(sorted.length * 2 / 3)] || 0);
+  return { count, withMe, often };
+}
+
+// Unlikely to play this week (Doubtful included: those players rarely suit up).
+const isOut = p => !!p.injury && /^(Out|Doubtful|IR|PUP|Sus|NA|DNR|COV)/i.test(p.injury);
+
+// Differences between my Sleeper lineup and my best available lineup (healthy, not on bye).
+function startSit(me, byes) {
+  const offense = p => ["QB", "RB", "WR", "TE"].includes(p.pos);
+  const onBye = p => !!byes && byes.includes(p.team);
+  const healthy = bestLineup(me.players.filter(p => !isOut(p) && !onBye(p)));
+  const best = new Set(Object.values(healthy).filter(Boolean).map(p => p.id));
+  const benched = me.players.filter(p => best.has(p.id) && !p.starter).sort((a, b) => b.season - a.season);
+  const extra = me.players.filter(p => p.starter && offense(p) && !best.has(p.id)).sort((a, b) => a.season - b.season);
+  const swaps = [];
+  for (const b of benched) {
+    // Swap with someone at the same position, or any RB/WR/TE when the FLEX makes it work.
+    let i = extra.findIndex(x => x.pos === b.pos);
+    if (i < 0 && b.pos !== "QB") i = extra.findIndex(x => x.pos !== "QB");
+    swaps.push({ start: b, sit: i >= 0 ? extra.splice(i, 1)[0] : null });
+  }
+  // Injured or bye-week starters already show up in "extra"; call them out separately.
+  const injured = extra.filter(isOut);
+  const bye = extra.filter(p => !isOut(p) && onBye(p));
+  const leftover = extra.filter(p => !isOut(p) && !onBye(p));
+  return { swaps, extra: leftover, injured, bye, count: swaps.length + leftover.length + injured.length + bye.length };
 }
 
 function bestLineup(players) {
@@ -426,9 +537,10 @@ async function findTrades(me, teams, locked, onProgress) {
   // Every package of 1..maxSend of my assets, sorted by value so we can jump to the right price range.
   const combos = [];
   (function build(start, items) {
-    if (items.length) {
-      combos.push({ items, sent: items.reduce((n, p) => n + p.dynasty, 0),
-                    hasPick: items.some(p => p.pos === "PICK"),
+    const picks = items.filter(p => p.pos === "PICK").length;
+    // 4-asset packages are only for paying with picks: keep them when 2+ are picks.
+    if (items.length && (items.length < 4 || picks >= 2)) {
+      combos.push({ items, sent: items.reduce((n, p) => n + p.dynasty, 0), picks,
                     playerKey: items.filter(p => p.pos !== "PICK").map(p => p.id).join(",") });
     }
     if (items.length === RULES.maxSend) return;
@@ -498,7 +610,9 @@ async function findTrades(me, teams, locked, onProgress) {
         if (!cards.has(cardKey)) cards.set(cardKey, { key: cardKey, team, get: get.players,
           starterForThem: get.players.some(p => theirStarters.has(p.id)), pkgs: [] });
         cards.get(cardKey).pkgs.push({ give: c.items, getPicks: get.picks, sent: c.sent, getValue, ratio,
-          gain: fx.gain, theirChange: fx.theirChange, startsFor: fx.startsFor, startsForMe: fx.startsForMe, sendsPick: c.hasPick });
+          gain: fx.gain, theirChange: fx.theirChange, startsFor: fx.startsFor, startsForMe: fx.startsForMe,
+          sendsPick: c.picks > 0, picksSent: c.picks,
+          getTrend: [...get.players, ...get.picks].reduce((n, p) => n + (p.trend || 0), 0) });
       }
     }
   }
@@ -511,6 +625,9 @@ async function findTrades(me, teams, locked, onProgress) {
     const best = card.pkgs.sort((a, b) => b.gain - a.gain || a.ratio - b.ratio);
     const kept = new Set();
     for (const k of kinds) best.filter(k).slice(0, RULES.keepPerKind).forEach(p => kept.add(p));
+    // Plus the offers that pay with the most picks (otherwise they rarely survive the cut).
+    best.filter(p => p.picksSent >= 2).sort((a, b) => b.picksSent - a.picksSent || b.gain - a.gain)
+        .slice(0, RULES.keepPerKind).forEach(p => kept.add(p));
     card.pkgs = [...kept].sort((a, b) => b.gain - a.gain || a.ratio - b.ratio);
     card.bestGain = card.pkgs[0].gain;
     out.push(card);
@@ -523,10 +640,14 @@ async function findTrades(me, teams, locked, onProgress) {
 // ======================= app state =======================
 const S = {
   raw: null, teams: [], me: null, bar: {}, cards: [], current: 0, busy: false,
+  freeAgents: [], activity: null, alerts: null,
   tab: store.get("tab", "trades"),
   locked: null,                       // Set of my asset ids I won't trade
+  saved: store.get("saved_v1", []),   // starred offers: [{ rid, give: [ids], get: [ids], at }]
+  showSaved: false,
   f: { types: new Set(["Contender", "Middle", "Rebuilder"]), get: new Set(["one", "two", "picks"]),
-       send: 3, sendPicks: "any", need: null, noHurt: false, starts: false, q: "", sort: "gain",
+       send: 4, sendPicks: "any", need: null, noHurt: false, starts: false, q: "", sort: "gain",
+       activeOnly: false,             // only teams that trade often
        team: null },                  // roster id of one partner team, or null for all teams
   filtersOpen: false,
   featured: new Map(), open: new Set(), leagueOpen: null,
@@ -546,12 +667,40 @@ function avatar(p, size = "") {
 }
 function injTag(p) {
   if (!p.injury) return "";
-  const severe = /^(Out|IR|PUP|Sus|NA|DNR|COV)/i.test(p.injury);
-  return `<span class="tag ${severe ? "inj" : "q"}">${esc(p.injury)}</span>`;
+  return `<span class="tag ${isOut(p) ? "inj" : "q"}">${esc(p.injury)}</span>`;
+}
+// 30-day value change from FantasyCalc, shown only when it's a real move.
+function trendTag(p) {
+  const t = p.trend || 0;
+  if (Math.abs(t) < 150 && Math.abs(t) < 0.05 * p.dynasty) return "";
+  return `<span class="trend ${t > 0 ? "up" : "down"}" title="Value change, last 30 days">${t > 0 ? "▲" : "▼"} ${fmt(Math.abs(t))}</span>`;
 }
 function metaLine(p) {
-  if (p.pos === "PICK") return `<span class="pos PICK">PICK</span>${p.via ? `<span>via ${esc(p.via)}</span>` : ""}`;
-  return `<span class="pos ${p.pos}">${p.pos}</span>${p.team ? `<span>${p.team}</span>` : `<span>FA</span>`}${p.age ? `<span>${p.age} yrs</span>` : ""}${injTag(p)}`;
+  if (p.pos === "PICK") return `<span class="pos PICK">PICK</span>${p.via ? `<span>via ${esc(p.via)}</span>` : ""}${trendTag(p)}`;
+  const bye = p.team && S.raw && S.raw.byes && S.raw.byes.includes(p.team) ? `<span class="tag q">Bye</span>` : "";
+  return `<span class="pos ${p.pos}">${p.pos}</span>${p.team ? `<span>${p.team}</span>` : `<span>FA</span>`}${p.age ? `<span>${p.age} yrs</span>` : ""}${injTag(p)}${bye}${trendTag(p)}`;
+}
+function tradesTag(t) {
+  const a = S.activity;
+  if (!a || t === S.me) return "";
+  const n = a.count[t.rid] || 0;
+  if (n >= a.often) return `<span class="tag active">Trades often · ${n}</span>`;
+  return `<span>${n ? `${n} trade${n > 1 ? "s" : ""}` : "Rarely trades"}</span>`;
+}
+const STAR_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9z"/></svg>`;
+const savedKey = (rid, give, get) => `${rid}|${[...give].sort().join(",")}|${[...get].sort().join(",")}`;
+const isSaved = (rid, give, get) => S.saved.some(s => savedKey(s.rid, s.give, s.get) === savedKey(rid, give, get));
+function starBtn(rid, give, get, extra = "") {
+  const on = isSaved(rid, give, get);
+  return `<button type="button" class="linkbtn star ${on ? "on" : ""}" data-act="star" data-rid="${rid}"
+    data-give="${esc(give.join(","))}" data-get="${esc(get.join(","))}" ${extra} aria-pressed="${on}">${STAR_SVG}${on ? "Saved" : "Save"}</button>`;
+}
+// The "You get / You give" block plus the verdict, shared by trade cards, saved offers and the calculator.
+function offerBlock(r) {
+  return `<div class="offer">
+      <div class="side"><h3><span>You get</span><span class="num">${fmt(r.got)}</span></h3>${r.get.map(a => assetRow(a, myTag(a, r.startsForMe))).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
+      <div class="side"><h3><span>You give</span><span class="num">${fmt(r.sent)}</span></h3>${r.give.map(a => assetRow(a, theirTag(a, r.startsFor))).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
+    </div>${verdict(r.gain, r.theirChange, r.ratio)}`;
 }
 function assetRow(p, extra = "") {
   return `<div class="asset">${avatar(p)}<div class="who"><div class="nm">${esc(p.name)}</div><div class="meta">${metaLine(p)}${extra}</div></div>
@@ -588,6 +737,7 @@ function pkgVisible(card, p) {
   if (p.give.length > f.send) return false;
   if (f.sendPicks === "no" && p.sendsPick) return false;
   if (f.sendPicks === "yes" && !p.sendsPick) return false;
+  if (f.sendPicks === "multi" && p.picksSent < 2) return false;
   if (p.getPicks.length && !f.get.has("picks")) return false;
   if (f.noHurt && p.theirChange < 0) return false;
   if (f.starts && !Object.keys(p.startsFor).length) return false;
@@ -595,11 +745,14 @@ function pkgVisible(card, p) {
 }
 function visibleCards() {
   const f = S.f, q = f.q.trim().toLowerCase();
-  const score = p => f.sort === "gain" ? p.gain : f.sort === "theirs" ? p.theirChange : -p.ratio;
+  const score = p => f.sort === "gain" ? p.gain : f.sort === "theirs" ? p.theirChange
+                   : f.sort === "buylow" ? -p.getTrend : -p.ratio;
+  const a = S.activity;
   const res = [];
   for (const card of S.cards) {
     if (f.team !== null) { if (card.team.rid !== f.team) continue; }   // one team picked: ignore the type chips
     else if (!f.types.has(card.team.type)) continue;
+    if (f.activeOnly && a && (a.count[card.team.rid] || 0) < a.often) continue;
     if (card.get.length === 1 && !f.get.has("one") && !f.get.has("picks")) continue;
     if (card.get.length === 2 && !f.get.has("two")) continue;
     if (f.need && !card.get.some(p => SLOT_POS[f.need].includes(p.pos))) continue;
@@ -625,6 +778,7 @@ function renderTrades() {
   const vis = S.busy ? [] : visibleCards();
   const total = vis.reduce((n, v) => n + v.pkgs.length, 0);
 
+  if (S.showSaved) { el.innerHTML = savedHTML(); return; }
   el.innerHTML = `
     <h2>Fix your weak spots</h2>
     <div class="chips">${needs || `<span class="muted">Every lineup spot is at or above the playoff bar.</span>`}</div>
@@ -632,6 +786,7 @@ function renderTrades() {
 
     <div class="count" style="margin-top:18px">
       <button type="button" class="btn btn-ghost filters-toggle" data-act="filters">${S.filtersOpen ? "Hide filters" : "Filters & sort"}</button>
+      <button type="button" class="btn btn-ghost" data-act="saved-toggle">${STAR_SVG} Saved offers (${S.saved.length})</button>
     </div>
     <div class="panel filters ${S.filtersOpen ? "" : "collapsed"}">
       <div class="search">
@@ -640,6 +795,7 @@ function renderTrades() {
           <option value="gain" ${f.sort === "gain" ? "selected" : ""}>Biggest boost to my lineup</option>
           <option value="theirs" ${f.sort === "theirs" ? "selected" : ""}>Best for the other team</option>
           <option value="cost" ${f.sort === "cost" ? "selected" : ""}>Cheapest price</option>
+          <option value="buylow" ${f.sort === "buylow" ? "selected" : ""}>Buy low (value dropped)</option>
         </select>
       </div>
       <div class="frow"><span class="lbl">Team</span><div class="search">
@@ -647,10 +803,12 @@ function renderTrades() {
           <option value="" ${f.team === null ? "selected" : ""}>All teams</option>
           ${S.teams.filter(t => t !== me).map(t => `<option value="${t.rid}" ${f.team === t.rid ? "selected" : ""}>${esc(t.name)} (${t.type}, ${t.record})</option>`).join("")}
         </select></div></div>
-      ${f.team === null ? `<div class="frow"><span class="lbl">Trade with</span>${chipsHTML("types", [["Contender", "Contenders"], ["Middle", "Middle"], ["Rebuilder", "Rebuilders"]], v => f.types.has(v))}</div>` : ""}
+      ${f.team === null ? `<div class="frow"><span class="lbl">Trade with</span><div class="chips">
+        ${chipsHTML("types", [["Contender", "Contenders"], ["Middle", "Middle"], ["Rebuilder", "Rebuilders"]], v => f.types.has(v))}
+        ${S.activity ? chipsHTML("active", [["on", "Only active traders"]], () => f.activeOnly) : ""}</div></div>` : ""}
       <div class="frow"><span class="lbl">I get</span>${chipsHTML("get", [["one", "1 player"], ["two", "2 players"], ["picks", "Player + pick back"]], v => f.get.has(v))}</div>
-      <div class="frow"><span class="lbl">I send</span>${chipsHTML("send", [[1, "1 asset"], [2, "Up to 2"], [3, "Up to 3"]], v => f.send === +v)}</div>
-      <div class="frow"><span class="lbl">My picks</span>${chipsHTML("sendPicks", [["any", "Any"], ["no", "Keep my picks"], ["yes", "Include picks"]], v => f.sendPicks === v)}</div>
+      <div class="frow"><span class="lbl">I send</span>${chipsHTML("send", [[1, "1 asset"], [2, "Up to 2"], [3, "Up to 3"], [4, "Up to 4"]], v => f.send === +v)}</div>
+      <div class="frow"><span class="lbl">My picks</span>${chipsHTML("sendPicks", [["any", "Any"], ["no", "Keep my picks"], ["yes", "Include picks"], ["multi", "2+ picks"]], v => f.sendPicks === v)}</div>
       <div class="frow"><span class="lbl">Their side</span><div class="chips" style="gap:14px">
         <label class="check"><input type="checkbox" id="noHurt" ${f.noHurt ? "checked" : ""}> Their lineup doesn't get worse</label>
         <label class="check"><input type="checkbox" id="starts" ${f.starts ? "checked" : ""}> One of my players would start for them</label></div></div>
@@ -668,25 +826,42 @@ function cardHTML({ card, pkgs }) {
   const t = card.team;
   const getAssets = [...card.get, ...p.getPicks];
   const open = S.open.has(card.key);
-  const giveRows = p.give.map(g => assetRow(g, theirTag(g, p.startsFor))).join("");
   const alts = pkgs.map((q, i) => `<button type="button" class="alt ${i === sel ? "on" : ""}" data-act="feature" data-card="${esc(card.key)}" data-i="${i}">
       <span class="g">${q.give.map(g => esc(g.name)).join(" + ")}${q.getPicks.length ? ` <span class="muted">(get back ${esc(q.getPicks[0].name)})</span>` : ""}</span>
       <span class="num good">${signed(q.gain)}</span><span class="num muted">${Math.round(q.ratio * 100)}%</span></button>`).join("");
   return `<article class="panel card">
     <div class="card-top"><b>${esc(t.name)}</b><span class="type ${t.type}">${t.type}</span><span>${t.record} · lineup #${t.rank}</span>
       <span>· needs ${t.needs.slice(0, 3).join(", ") || "nothing"}</span>
-      <span>· ${card.starterForThem ? "takes a starter" : "from their bench"}</span></div>
-    <div class="offer">
-      <div class="side"><h3><span>You get</span><span class="num">${fmt(p.getValue)}</span></h3>${getAssets.map(a => assetRow(a, myTag(a, p.startsForMe))).join("")}</div>
-      <div class="side"><h3><span>You give</span><span class="num">${fmt(p.sent)}</span></h3>${giveRows}</div>
-    </div>
-    ${verdict(p.gain, p.theirChange, p.ratio)}
+      <span>· ${card.starterForThem ? "takes a starter" : "from their bench"}</span>${tradesTag(t)}</div>
+    ${offerBlock({ get: getAssets, give: p.give, got: p.getValue, sent: p.sent, gain: p.gain, theirChange: p.theirChange,
+                   ratio: p.ratio, startsFor: p.startsFor, startsForMe: p.startsForMe })}
     <div class="card-actions">
       ${pkgs.length > 1 ? `<button type="button" class="linkbtn" data-act="more" data-card="${esc(card.key)}">${open ? "Hide other offers" : `See ${pkgs.length - 1} other offer${pkgs.length > 2 ? "s" : ""}`}</button>` : "<span></span>"}
-      <button type="button" class="linkbtn" data-act="to-calc" data-card="${esc(card.key)}" data-i="${sel}">Open in calculator</button>
+      <span class="chips" style="gap:16px">
+        ${starBtn(t.rid, p.give.map(g => g.id), getAssets.map(g => g.id))}
+        <button type="button" class="linkbtn" data-act="to-calc" data-card="${esc(card.key)}" data-i="${sel}">Open in calculator</button></span>
     </div>
     ${open ? `<div class="alts">${alts}</div>` : ""}
   </article>`;
+}
+
+// Saved offers, re-checked against today's rosters and values every time.
+function savedHTML() {
+  const rows = S.saved.map((s, i) => {
+    const partner = S.teams.find(t => t.rid === s.rid);
+    const give = new Set(s.give), get = new Set(s.get);
+    const ok = partner && s.give.every(id => S.me.players.some(p => p.id === id)) && s.get.every(id => partner.players.some(p => p.id === id));
+    const head = `<div class="card-top"><b>${esc(partner ? partner.name : "Unknown team")}</b>${partner ? `<span class="type ${partner.type}">${partner.type}</span><span>${partner.record}</span>${tradesTag(partner)}` : ""}
+      <span>· saved ${new Date(s.at).toLocaleDateString([], { month: "short", day: "numeric" })}</span></div>`;
+    const actions = `<div class="card-actions"><button type="button" class="linkbtn" data-act="saved-remove" data-i="${i}">Remove</button>
+      ${ok ? `<button type="button" class="linkbtn" data-act="saved-calc" data-i="${i}">Open in calculator</button>` : ""}</div>`;
+    if (!ok) return `<article class="panel card">${head}<div class="banner" style="margin:0">No longer possible: a player or pick in this offer has changed teams.</div>${actions}</article>`;
+    return `<article class="panel card">${head}${offerBlock(evalTrade(partner, give, get))}${actions}</article>`;
+  }).join("");
+  return `<div class="count" style="margin-top:4px"><h2 style="margin:0">Saved offers</h2>
+      <button type="button" class="btn btn-ghost" data-act="saved-toggle">Back to all trades</button></div>
+    <p class="muted" style="font-size:13px;margin-top:0">Numbers update with each refresh, so you can see if an offer still makes sense. Saved on this phone only.</p>
+    <div class="cards">${rows || `<div class="panel loading">No saved offers yet. Tap Save on any trade card or in the calculator.</div>`}</div>`;
 }
 
 // ======================= My Team tab =======================
@@ -712,10 +887,41 @@ function renderTeam() {
       ${p.dynasty > 0 ? `<button type="button" class="lock ${on ? "on" : ""}" data-act="lock" data-v="${esc(p.id)}" aria-pressed="${on}" title="${on ? "Untouchable: never offered" : "Tradeable"}">${on ? LOCK_SVG : UNLOCK_SVG}</button>` : "<span></span>"}
     </div>`;
   }).join("");
+  // Start/sit callout
+  const al = S.alerts;
+  const name = p => `<b>${esc(p.name)}</b> <span class="muted">(${fmt(p.season)})</span>`;
+  const alertItems = al ? [
+    ...al.swaps.map(s => `<li>Start ${name(s.start)}${s.sit ? ` over ${name(s.sit)}` : ""}</li>`),
+    ...al.injured.map(p => `<li>${name(p)} is in your lineup but listed <b>${esc(p.injury)}</b></li>`),
+    ...al.bye.map(p => `<li>${name(p)} is in your lineup but <b>on bye</b> this week</li>`),
+    ...al.extra.map(p => `<li>${name(p)} is starting but isn't in your best healthy lineup</li>`),
+  ] : [];
+  const alertHTML = alertItems.length ? `<div class="panel alert"><div class="alert-h">Lineup check</div><ul>${alertItems.join("")}</ul>
+      <div class="muted" style="font-size:12px">${S.raw.week ? `Week ${S.raw.week}. ` : ""}Based on rest-of-season value, skipping injured${S.raw.byes ? " and bye-week" : ""} players. Check matchups before you change your Sleeper lineup.</div></div>`
+    : `<div class="panel alert ok"><div class="alert-h">Lineup check</div>Your Sleeper lineup matches your best available lineup${S.raw.week ? ` for week ${S.raw.week}` : ""}.</div>`;
+
+  // Free agents who'd start for me
+  const myBest = new Set(Object.values(me.lineup).filter(Boolean).map(p => p.id));
+  const fas = S.freeAgents.map(fa => {
+    const lu = bestLineup([...me.players, fa]);
+    const slot = slotsOf(lu, new Set([fa.id]))[fa.id];
+    if (!slot) return null;
+    const inNow = new Set(Object.values(lu).filter(Boolean).map(p => p.id));
+    const bumped = me.players.find(p => myBest.has(p.id) && !inNow.has(p.id));
+    return { fa, slot, gain: lineupTotal(lu) - me.lineupValue, bumped };
+  }).filter(x => x && x.gain > 0).sort((a, b) => b.gain - a.gain).slice(0, 8);
+  const faHTML = fas.map(x => `<div class="rrow">${avatar(x.fa, "sm")}<div style="min-width:0"><div class="nm" style="font-weight:600">${esc(x.fa.name)}</div>
+      <div class="meta muted" style="font-size:12px;display:flex;gap:6px;flex-wrap:wrap">${metaLine(x.fa)}<span class="starts">starts at ${x.slot} for you</span>${x.bumped ? `<span>bumps ${esc(x.bumped.name)}</span>` : ""}</div></div>
+      <div class="val"><b class="good">${signed(x.gain)}</b>lineup</div><div class="val"><b>${fmt(x.fa.season)}</b>season</div><span></span></div>`).join("");
+
   el.innerHTML = `
+    ${alertHTML}
     <h2>Best lineup vs. the playoff bar</h2>
     <div class="panel lineup">${lineup}</div>
     <p class="muted" style="font-size:13px">Bar = average of the top ${PLAYOFF_TEAMS} lineups (this-season value). Your best lineup is worth ${fmt(me.lineupValue)}, #${me.rank} of ${S.teams.length}.</p>
+    <h2>Free agents who'd start for you</h2>
+    <p class="muted" style="font-size:13px;margin-top:-4px">Unrostered players who'd crack your best lineup right now. No trade needed, just a waiver claim.</p>
+    <div class="panel roster">${faHTML || `<div class="loading" style="padding:16px">No free agent would start for you right now.</div>`}</div>
     <h2>Roster and picks</h2>
     <p class="muted" style="font-size:13px;margin-top:-4px">Lock a player or pick to keep him out of every trade idea. <span class="dot"></span> = in your Sleeper lineup this week.</p>
     <div class="panel roster">${rows}</div>`;
@@ -731,8 +937,10 @@ function renderLeague() {
     return `<tr class="team-row ${t === S.me ? "me" : ""}" data-act="league-row" data-v="${t.rid}">
       <td class="r">${t.rank}</td><td>${esc(t.name)}</td><td><span class="type ${t.type}">${t.type}</span></td><td>${t.record}</td>
       <td class="r">${fmt(t.lineupValue)}</td><td class="r">${fmt(t.dynasty)}</td><td class="r">${fmt(t.picksValue)}</td>
+      ${S.activity ? `<td class="r">${S.activity.count[t.rid] || 0}${(S.activity.count[t.rid] || 0) >= S.activity.often ? ` <span class="tag active">often</span>` : ""}</td>` : ""}
       <td class="muted">${t.needs.slice(0, 3).join(", ") || "—"}</td></tr>
-      ${open ? `<tr class="team-detail"><td colspan="8"><div style="font-size:12px;font-weight:700;color:var(--muted);margin-bottom:6px">BEST LINEUP</div>
+      ${open ? `<tr class="team-detail"><td colspan="9">${S.activity && t !== S.me ? `<div style="font-size:13px;margin-bottom:8px">Trades this season and last: <b>${S.activity.count[t.rid] || 0}</b> · with you: <b>${S.activity.withMe[t.rid] || 0}</b></div>` : ""}
+        <div style="font-size:12px;font-weight:700;color:var(--muted);margin-bottom:6px">BEST LINEUP</div>
         <div class="mini">${lu.map(p => `<div class="asset">${avatar(p, "sm")}<div class="who"><div class="nm" style="font-size:13px">${esc(p.name)}</div><div class="meta">${metaLine(p)} ${fmt(p.season)}</div></div></div>`).join("")}</div>
         ${t !== S.me ? `<div class="chips" style="margin-top:10px">
           <button type="button" class="btn btn-accent" data-act="ideas-with" data-v="${t.rid}">See trade ideas with ${esc(t.name)}</button>
@@ -742,9 +950,9 @@ function renderLeague() {
     <h2>League at a glance</h2>
     <p class="muted" style="font-size:13px;margin-top:-4px">Ranked by best starting lineup this season. Tap a team to see its lineup.</p>
     <div class="panel scroll"><table>
-      <tr><th class="r">#</th><th>Team</th><th>Type</th><th>Rec</th><th class="r">Lineup</th><th class="r">Dynasty</th><th class="r">Picks</th><th>Weak spots</th></tr>
+      <tr><th class="r">#</th><th>Team</th><th>Type</th><th>Rec</th><th class="r">Lineup</th><th class="r">Dynasty</th><th class="r">Picks</th>${S.activity ? `<th class="r">Trades</th>` : ""}<th>Weak spots</th></tr>
       ${rows}</table></div>
-    <p class="muted" style="font-size:13px">Contender: top-4 lineup, or top-7 with 2+ wins. Rebuilder: bottom-3 lineup, or bottom half and winless. Dynasty includes 2027–28 picks.</p>`;
+    <p class="muted" style="font-size:13px">Contender: top-4 lineup, or top-7 with 2+ wins. Rebuilder: bottom-3 lineup, or bottom half and winless. Dynasty includes 2027–28 picks.${S.activity ? ` Trades = completed trades this season and last.` : ""}</p>`;
 }
 
 // ======================= Calculator tab =======================
@@ -780,11 +988,8 @@ function renderCalc() {
       <button type="button" class="btn btn-ghost" data-act="calc-clear">Clear</button>
     </div>
     <div class="panel calc-result">
-      ${empty ? `<div class="muted">Select players or picks below.</div>` : `
-      <div class="offer">
-        <div class="side"><h3><span>You get</span><span class="num">${fmt(r.got)}</span></h3>${r.get.map(a => assetRow(a, myTag(a, r.startsForMe))).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
-        <div class="side"><h3><span>You give</span><span class="num">${fmt(r.sent)}</span></h3>${r.give.map(a => assetRow(a, theirTag(a, r.startsFor))).join("") || `<div class="muted" style="font-size:13px">Nothing yet</div>`}</div>
-      </div>${verdict(r.gain, r.theirChange, r.ratio)}`}
+      ${empty ? `<div class="muted">Select players or picks below.</div>` : `${offerBlock(r)}
+      <div class="card-actions"><span></span>${starBtn(partner.rid, [...c.give], [...c.get])}</div>`}
     </div>
     <div class="calc-grid">
       <div class="panel"><div class="listhead"><span>You give</span><span>${esc(S.me.name)}</span></div>${list(S.me, c.give, "give")}</div>
@@ -801,6 +1006,8 @@ function render() {
   if (S.me) {
     $("sub").textContent = `${S.me.name} · ${S.me.record} · lineup #${S.me.rank} of ${S.teams.length} · ${S.me.type}`;
   }
+  // A dot on My Team when the lineup check found something.
+  document.querySelector('.tab[data-tab="team"]').classList.toggle("alerting", !!(S.alerts && S.alerts.count));
   ({ trades: renderTrades, team: renderTeam, league: renderLeague, calc: renderCalc })[S.tab]();
 }
 
@@ -815,6 +1022,7 @@ document.addEventListener("click", e => {
   if (act === "chip") {
     const g = b.dataset.group;
     if (g === "types" || g === "get") f[g].has(v) ? f[g].delete(v) : f[g].add(v);
+    else if (g === "active") f.activeOnly = !f.activeOnly;
     else if (g === "send") f.send = +v;
     else f[g] = v;
   } else if (act === "need") f.need = f.need === v ? null : v;
@@ -838,6 +1046,19 @@ document.addEventListener("click", e => {
   else if (act === "calc-with") { S.calc = { partner: +v, give: new Set(), get: new Set() }; return setTab("calc"); }
   else if (act === "calc-toggle") { const set = b.dataset.side === "give" ? S.calc.give : S.calc.get; set.has(v) ? set.delete(v) : set.add(v); }
   else if (act === "calc-clear") { S.calc.give.clear(); S.calc.get.clear(); }
+  else if (act === "star") {
+    const rid = +b.dataset.rid, give = b.dataset.give.split(",").filter(Boolean), get = b.dataset.get.split(",").filter(Boolean);
+    const k = savedKey(rid, give, get);
+    const i = S.saved.findIndex(s => savedKey(s.rid, s.give, s.get) === k);
+    if (i >= 0) S.saved.splice(i, 1); else S.saved.unshift({ rid, give, get, at: Date.now() });
+    store.set("saved_v1", S.saved);
+  } else if (act === "saved-toggle") { S.showSaved = !S.showSaved; window.scrollTo({ top: 0 }); }
+  else if (act === "saved-remove") { S.saved.splice(+b.dataset.i, 1); store.set("saved_v1", S.saved); }
+  else if (act === "saved-calc") {
+    const s = S.saved[+b.dataset.i];
+    S.calc = { partner: s.rid, give: new Set(s.give), get: new Set(s.get) };
+    return setTab("calc");
+  }
   render();
 });
 document.addEventListener("input", e => {
@@ -874,6 +1095,9 @@ function useData(raw) {
   S.raw = raw;
   const { teams, bar, me } = analyze(buildTeams(raw));
   S.teams = teams; S.bar = bar; S.me = me;
+  S.freeAgents = buildFreeAgents(raw);
+  S.activity = tradeActivity(raw.trades);
+  S.alerts = startSit(me, raw.byes);
   if (!S.locked) {
     const saved = store.get("locked", null);
     S.locked = new Set(saved || me.players.filter(p => DEFAULT_LOCKED.includes(p.name)).map(p => p.id));
